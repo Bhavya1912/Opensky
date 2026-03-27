@@ -10,6 +10,7 @@ const PORT = process.env.PORT || 3001;
 
 // Cache flight data for 8 seconds
 const flightCache = new NodeCache({ stdTTL: 8, checkperiod: 10 });
+const routeCache = new NodeCache({ stdTTL: 1800, checkperiod: 300 });
 
 app.use(
   cors({
@@ -46,6 +47,61 @@ const F = {
   GEO_ALTITUDE: 13,
   SQUAWK: 14,
 };
+
+
+function airlineFromCallsign(callsign) {
+  const normalized = (callsign || "").trim().toUpperCase();
+  const code = normalized.slice(0, 3).replace(/[^A-Z]/g, "");
+
+  const AIRLINES = {
+    AAL: "American Airlines",
+    DAL: "Delta Air Lines",
+    UAL: "United Airlines",
+    SWA: "Southwest Airlines",
+    JBU: "JetBlue",
+    FFT: "Frontier Airlines",
+    NKS: "Spirit Airlines",
+    ASA: "Alaska Airlines",
+    BAW: "British Airways",
+    AFR: "Air France",
+    KLM: "KLM",
+    DLH: "Lufthansa",
+    UAE: "Emirates",
+    QTR: "Qatar Airways",
+    SIA: "Singapore Airlines",
+    RYR: "Ryanair",
+    EZY: "easyJet",
+    THY: "Turkish Airlines",
+    ANA: "All Nippon Airways",
+    JAL: "Japan Airlines",
+    CPA: "Cathay Pacific",
+  };
+
+  return {
+    airlineCode: code || null,
+    airline: AIRLINES[code] || (code ? `${code} (unmapped)` : null),
+  };
+}
+
+function parseRoute(data) {
+  if (Array.isArray(data)) {
+    const [departureIcao, arrivalIcao] = data;
+    return {
+      departureIcao: departureIcao || null,
+      arrivalIcao: arrivalIcao || null,
+    };
+  }
+
+  if (Array.isArray(data?.route)) {
+    const [departureIcao, arrivalIcao] = data.route;
+    return {
+      departureIcao: departureIcao || null,
+      arrivalIcao: arrivalIcao || null,
+    };
+  }
+
+  return { departureIcao: null, arrivalIcao: null };
+}
 
 function parseState(state) {
   const lat = state[F.LATITUDE];
@@ -122,6 +178,56 @@ app.get("/api/flights", async (req, res) => {
     const status = err.response?.status || 500;
     if (status === 429) return res.status(429).json({ error: "OpenSky rate limit reached." });
     res.status(502).json({ error: "Failed to fetch flight data." });
+  }
+});
+
+
+// GET /api/flight-meta/:callsign
+app.get("/api/flight-meta/:callsign", async (req, res) => {
+  const callsignRaw = (req.params.callsign || "").trim().toUpperCase();
+  if (!callsignRaw) {
+    return res.status(400).json({ error: "Callsign is required." });
+  }
+
+  const cacheKey = `meta_${callsignRaw}`;
+  const cached = routeCache.get(cacheKey);
+  if (cached) return res.json({ ...cached, cached: true });
+
+  const airlineInfo = airlineFromCallsign(callsignRaw);
+
+  try {
+    const axiosConfig = { params: { callsign: callsignRaw }, timeout: 12000 };
+    if (process.env.OPENSKY_USERNAME && process.env.OPENSKY_PASSWORD) {
+      axiosConfig.auth = {
+        username: process.env.OPENSKY_USERNAME,
+        password: process.env.OPENSKY_PASSWORD,
+      };
+    }
+
+    const { data } = await axios.get("https://opensky-network.org/api/routes", axiosConfig);
+    const route = parseRoute(data);
+
+    const result = {
+      callsign: callsignRaw,
+      ...airlineInfo,
+      ...route,
+      cached: false,
+    };
+
+    routeCache.set(cacheKey, result);
+    res.json(result);
+  } catch (err) {
+    console.error("OpenSky route error:", err.message);
+    const fallback = {
+      callsign: callsignRaw,
+      ...airlineInfo,
+      departureIcao: null,
+      arrivalIcao: null,
+      unavailable: true,
+    };
+
+    routeCache.set(cacheKey, fallback);
+    res.json(fallback);
   }
 });
 

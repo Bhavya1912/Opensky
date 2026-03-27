@@ -1,15 +1,47 @@
-import React from "react";
+import React, { useEffect, useState } from "react";
 import {
   formatAlt, formatSpeed, formatVRate, vRateColor,
   altBand, formatCoord, flightPhase, headingLabel, aircraftColor,
 } from "../utils/format";
 
 export default function FlightPanel({ selected, onClose }) {
-  if (!selected) return <EmptyPanel />;
+  const [routeMeta, setRouteMeta] = useState({ airline: null, airlineCode: null, departureIcao: null, arrivalIcao: null });
 
-  const phase = flightPhase(selected);
-  const band  = altBand(selected.altFeet);
-  const color = aircraftColor(selected);
+  const phase = selected ? flightPhase(selected) : null;
+  const band  = selected ? altBand(selected.altFeet) : null;
+  const color = selected ? aircraftColor(selected) : "var(--accent-primary)";
+
+  useEffect(() => {
+    const controller = new AbortController();
+
+    if (!selected?.callsign) {
+      setRouteMeta({ airline: null, airlineCode: null, departureIcao: null, arrivalIcao: null });
+      return () => controller.abort();
+    }
+
+    const fetchRouteMeta = async () => {
+      try {
+        const response = await fetch(`/api/flight-meta/${encodeURIComponent(selected.callsign)}`, { signal: controller.signal });
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        const data = await response.json();
+        setRouteMeta({
+          airline: data.airline || null,
+          airlineCode: data.airlineCode || null,
+          departureIcao: data.departureIcao || null,
+          arrivalIcao: data.arrivalIcao || null,
+        });
+      } catch (err) {
+        if (err.name === "AbortError") return;
+        setRouteMeta((prev) => ({ ...prev, departureIcao: null, arrivalIcao: null }));
+      }
+    };
+
+    fetchRouteMeta();
+
+    return () => controller.abort();
+  }, [selected?.callsign]);
+
+  if (!selected) return <EmptyPanel />;
 
   return (
     <div style={{
@@ -75,6 +107,16 @@ export default function FlightPanel({ selected, onClose }) {
           {selected.lastContact && (
             <DataRow label="LAST CONTACT" value={new Date(selected.lastContact * 1000).toLocaleTimeString()} />
           )}
+        </Section>
+
+        <Section title="ROUTE">
+          <DataRow
+            label="AIRLINE"
+            value={routeMeta.airline || "Unknown"}
+            sub={routeMeta.airlineCode ? `IATA/ICAO code: ${routeMeta.airlineCode}` : null}
+          />
+          <DataRow label="DEPARTURE" value={routeMeta.departureIcao || "Unknown"} mono />
+          <DataRow label="ARRIVAL" value={routeMeta.arrivalIcao || "Unknown"} mono />
         </Section>
       </div>
 
@@ -159,7 +201,7 @@ function DataRow({ label, value, sub, color, bar, barColor }) {
     <div>
       <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline" }}>
         <span style={{ fontSize: 10, color: "var(--text-muted)", letterSpacing: "0.12em" }}>{label}</span>
-        <span style={{ fontSize: 13, fontWeight: 700, color: color || "var(--text-primary)" }}>{value}</span>
+        <span style={{ fontSize: 13, fontWeight: 700, color: color || "var(--text-primary)" }}>{value ?? "—"}</span>
       </div>
       {bar != null && (
         <div style={{ height: 2, background: "var(--border-subtle)", borderRadius: 1, marginTop: 4 }}>

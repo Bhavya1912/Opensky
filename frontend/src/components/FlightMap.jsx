@@ -1,7 +1,9 @@
-import React, { useEffect, useRef } from "react";
+import React, { useEffect, useMemo, useRef, useState } from "react";
 import L from "leaflet";
 import "leaflet/dist/leaflet.css";
 import { aircraftColor } from "../utils/format";
+
+const CHUNK_SIZE = 250;
 
 function createAircraftIcon(heading, color, isSelected) {
   const size = isSelected ? 28 : 20;
@@ -28,33 +30,66 @@ function createAircraftIcon(heading, color, isSelected) {
 
 export default function FlightMap({ flights, selectedFlight, onSelectFlight, filters }) {
   const containerRef = useRef(null);
-  const mapRef       = useRef(null);
-  const markersRef   = useRef({});
+  const mapRef = useRef(null);
+  const markersRef = useRef({});
+  const rafRef = useRef(null);
+  const [mapBounds, setMapBounds] = useState(null);
 
-  const visible = flights.filter((f) => {
-    if (filters.altFilter === "high") return f.altFeet > 10000;
-    if (filters.altFilter === "low")  return f.altFeet <= 10000;
-    return true;
-  });
+  const altitudeFiltered = useMemo(() => {
+    return flights.filter((f) => {
+      if (filters.altFilter === "high") return f.altFeet > 10000;
+      if (filters.altFilter === "low") return f.altFeet <= 10000;
+      return true;
+    });
+  }, [flights, filters.altFilter]);
+
+  const visible = useMemo(() => {
+    if (!mapBounds) return altitudeFiltered;
+
+    const paddedBounds = mapBounds.pad(0.25);
+    const inView = altitudeFiltered.filter((f) => paddedBounds.contains([f.lat, f.lon]));
+
+    if (selectedFlight && !inView.some((f) => f.icao24 === selectedFlight.icao24)) {
+      const selectedInFilter = altitudeFiltered.find((f) => f.icao24 === selectedFlight.icao24);
+      if (selectedInFilter) inView.push(selectedInFilter);
+    }
+
+    return inView;
+  }, [altitudeFiltered, mapBounds, selectedFlight]);
 
   // Init map once
   useEffect(() => {
     if (mapRef.current) return;
+
     mapRef.current = L.map(containerRef.current, { center: [20, 0], zoom: 3 });
     L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
       attribution: '© <a href="https://openstreetmap.org">OpenStreetMap</a>',
       maxZoom: 18,
     }).addTo(mapRef.current);
 
-    return () => { mapRef.current?.remove(); mapRef.current = null; };
+    const syncBounds = () => {
+      if (mapRef.current) setMapBounds(mapRef.current.getBounds());
+    };
+
+    syncBounds();
+    mapRef.current.on("moveend zoomend", syncBounds);
+
+    return () => {
+      if (rafRef.current) cancelAnimationFrame(rafRef.current);
+      mapRef.current?.off("moveend zoomend", syncBounds);
+      mapRef.current?.remove();
+      mapRef.current = null;
+    };
   }, []);
 
-  // Update markers
+  // Update markers in chunks to avoid blocking the UI thread
   useEffect(() => {
     if (!mapRef.current) return;
+    if (rafRef.current) cancelAnimationFrame(rafRef.current);
+
     const currentIds = new Set(visible.map((f) => f.icao24));
 
-    // Remove stale
+    // Remove stale markers first
     Object.keys(markersRef.current).forEach((id) => {
       if (!currentIds.has(id)) {
         markersRef.current[id].remove();
@@ -62,26 +97,43 @@ export default function FlightMap({ flights, selectedFlight, onSelectFlight, fil
       }
     });
 
-    // Add / update
-    visible.forEach((flight) => {
-      const isSelected = selectedFlight?.icao24 === flight.icao24;
-      const color = aircraftColor(flight);
-      const icon  = createAircraftIcon(flight.heading, color, isSelected);
+    let index = 0;
+    const renderChunk = () => {
+      const chunkEnd = Math.min(index + CHUNK_SIZE, visible.length);
 
-      if (markersRef.current[flight.icao24]) {
-        markersRef.current[flight.icao24].setLatLng([flight.lat, flight.lon]);
-        markersRef.current[flight.icao24].setIcon(icon);
-      } else {
-        const marker = L.marker([flight.lat, flight.lon], { icon })
-          .addTo(mapRef.current)
-          .bindTooltip(
-            `<span>${flight.callsign || flight.icao24.toUpperCase()}</span>`,
-            { className: "aircraft-tooltip", direction: "top", offset: [0, -12] }
-          )
-          .on("click", () => onSelectFlight(flight));
-        markersRef.current[flight.icao24] = marker;
+      for (; index < chunkEnd; index += 1) {
+        const flight = visible[index];
+        const isSelected = selectedFlight?.icao24 === flight.icao24;
+        const color = aircraftColor(flight);
+        const icon = createAircraftIcon(flight.heading, color, isSelected);
+
+        if (markersRef.current[flight.icao24]) {
+          markersRef.current[flight.icao24].setLatLng([flight.lat, flight.lon]);
+          markersRef.current[flight.icao24].setIcon(icon);
+        } else {
+          const marker = L.marker([flight.lat, flight.lon], { icon })
+            .addTo(mapRef.current)
+            .bindTooltip(
+              `<span>${flight.callsign || flight.icao24.toUpperCase()}</span>`,
+              { className: "aircraft-tooltip", direction: "top", offset: [0, -12] }
+            )
+            .on("click", () => onSelectFlight(flight));
+          markersRef.current[flight.icao24] = marker;
+        }
       }
-    });
+
+      if (index < visible.length) {
+        rafRef.current = requestAnimationFrame(renderChunk);
+      } else {
+        rafRef.current = null;
+      }
+    };
+
+    rafRef.current = requestAnimationFrame(renderChunk);
+
+    return () => {
+      if (rafRef.current) cancelAnimationFrame(rafRef.current);
+    };
   }, [visible, selectedFlight, onSelectFlight]);
 
   // Pan to selected
